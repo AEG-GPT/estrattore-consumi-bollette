@@ -1,4 +1,3 @@
-
 import io
 import re
 from typing import Dict, List, Optional, Tuple
@@ -14,8 +13,7 @@ st.set_page_config(page_title="Estrattore Consumi Bollette (Enel/Repower) → Ex
 st.title("⚡ Estrattore Consumi Bollette (Enel/Repower) → Excel")
 st.caption("Carica una o più bollette in PDF. Per ogni file verrà creato un foglio Excel con due tabelle: Grafico (kWh) e Fatturati (kWh).")
 
-# Metti True per mostrare il testo grezzo dei PDF quando il parsing fallisce
-DEBUG = False
+DEBUG = False  # metti True per vedere il testo grezzo dei PDF quando il parsing fallisce
 
 # =========================
 # Helpers
@@ -29,8 +27,7 @@ ABBR = ["Gen","Feb","Mar","Apr","Mag","Giu","Lug","Ago","Set","Ott","Nov","Dic"]
 MONTH_MAP = {m: i for i, m in enumerate(MONTHS_IT)}
 NORM_MONTH = {m: abbr for m, abbr in zip(MONTHS_IT, ABBR)}
 
-# numeri con 1.234 / 1 234 / 1’234 / 1234
-NUM_RE = r"(?:\d{1,3}(?:[.\s’']\d{3})*|\d+)"
+NUM_RE = r"(?:\d{1,3}(?:[.\s’']\d{3})*|\d+)"  # supporta 1.234, 1 234, 1’234, 1234
 SEP = r"[ \t]+"
 
 def _normalize(txt: str) -> str:
@@ -59,14 +56,12 @@ def validate_totals(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     return df, notes
 
 def detect_constant(text: str) -> int:
-    # Enel: "Costante Mis. 25,00" / "Costante Mis. 25.00"
     m = re.search(r"Costante\s*Mis\.?\s*[:=]?\s*(\d+(?:[.,]\d+)?)", text, re.IGNORECASE)
     if m:
         try:
             return int(round(float(m.group(1).replace(",", "."))))
         except Exception:
             pass
-    # Repower/altro: "costante 1,00"
     m = re.search(r"\bcostante\b\s*(\d+(?:[.,]\d+)?)", text, re.IGNORECASE)
     if m:
         try:
@@ -80,18 +75,11 @@ def detect_constant(text: str) -> int:
 # =========================
 
 def parse_enel(text: str) -> Optional[pd.DataFrame]:
-    """
-    Parser robusto per Enel:
-    - Titolo tollerante: 'Consumi (in kWh opzionale) degli ultimi .. mesi'
-    - Valori F1/F2/F3/Tot (anche se su più righe/colonne)
-    - Fallback: se il blocco non viene trovato, cerca direttamente le serie F1/F2/F3/Tot sull'intero testo
-    """
-    # 1) Prova a isolare il blocco vicino al titolo
+    """Parser tollerante per bollette Enel."""
     title_pat = re.compile(r"Consumi\s+(?:in\s+kWh\s+)?degli?\s+ultimi\s+\d{1,2}\s+mesi", re.IGNORECASE)
     m_title = title_pat.search(text)
-    block = text[m_title.start():m_title.start()+2500] if m_title else text  # fallback: tutto il testo
+    block = text[m_title.start():m_title.start()+2500] if m_title else text
 
-    # 2) Mesi (anno facoltativo) – best effort
     month_pat = re.compile(rf"\b({'|'.join(MONTHS_IT)})\b(?:\s+20\d{{2}})?", re.IGNORECASE)
     labels: List[str] = []
     if m_title:
@@ -103,11 +91,9 @@ def parse_enel(text: str) -> Optional[pd.DataFrame]:
             if y:
                 lab = f"{lab} {y.group(0)}"
             labels.append(lab)
-        # dedup preservando ordine
         seen = set()
         labels = [l for l in labels if not (l in seen or seen.add(l))]
 
-    # 3) Serie numeriche – senza ancoraggio a inizio riga (gestisce colonne/accapo)
     def grab_any(prefixes, hay):
         pfx = r"|".join([re.escape(p) for p in prefixes])
         m = re.search(rf"(?:{pfx})\s*[:-]?\s*((?:{NUM_RE}\s*){{6,}})", hay, re.IGNORECASE)
@@ -123,7 +109,6 @@ def parse_enel(text: str) -> Optional[pd.DataFrame]:
     f3_vals = grab_any(["F3","F 3","Fascia 3","FASCIA 3"], block)
     tot_vals = grab_any(["Tot","Totale","TOTALE","TOT"], block)
 
-    # 4) Se qualcosa manca, riprova sul testo completo
     if not (f1_vals and f2_vals and f3_vals and tot_vals):
         f1_vals = f1_vals or grab_any(["F1","F 1","Fascia 1","FASCIA 1"], text)
         f2_vals = f2_vals or grab_any(["F2","F 2","Fascia 2","FASCIA 2"], text)
@@ -151,51 +136,56 @@ def parse_enel(text: str) -> Optional[pd.DataFrame]:
     })
 
 def parse_repower(text: str) -> Optional[pd.DataFrame]:
-    """
-    Parser robusto per Repower:
-    - cerca il blocco 'Andamento storico ... Energia'
-    - righe: '<mese> <anno> F1 F2 F3 Totale'
-    """
-    m = re.search(r"Andamento\s+storico.*?Energia.*?(?=Potenza|Cosφ|Legenda|$)",
-                  text, re.IGNORECASE | re.DOTALL)
+    """Parser Repower centrato sulla sezione ENERGIA."""
+    m = re.search(
+        r"\bENERGIA\b.*?(?=\b(POTENZA|POTENZE|COS.?φ|LEGENDA|NOTE|TARIFFE|ALTRE\s+VOCI)\b|$)",
+        text, re.IGNORECASE | re.DOTALL
+    )
+    if not m:
+        m = re.search(
+            r"Andamento\s+storico.*?\bENERGIA\b.*?(?=\b(POTENZA|POTENZE|COS.?φ|LEGENDA|NOTE|TARIFFE|ALTRE\s+VOCI)\b|$)",
+            text, re.IGNORECASE | re.DOTALL
+        )
     if not m:
         return None
+
     block = m.group(0)
 
-    rows = []
     pat = re.compile(
-        rf"\b({'|'.join(MONTHS_IT)}){SEP}(20\d{{2}}){SEP}({NUM_RE}){SEP}({NUM_RE}){SEP}({NUM_RE}){SEP}({NUM_RE})",
+        rf"\b({'|'.join(MONTHS_IT)}){SEP}(20\d{{2}}){SEP}({NUM_RE}){SEP}({NUM_RE}){SEP}({NUM_RE}){SEP}({NUM_RE})\b",
         re.IGNORECASE
     )
+
+    rows = []
     for mm in pat.finditer(block):
         mese = mm.group(1).lower()
-        anno = mm.group(2)
+        anno = int(mm.group(2))
         f1 = norm_int(mm.group(3))
         f2 = norm_int(mm.group(4))
         f3 = norm_int(mm.group(5))
         tot = norm_int(mm.group(6))
-        rows.append((int(anno), MONTH_MAP[mese], f"{NORM_MONTH[mese]} {anno}", f1, f2, f3, tot))
+        rows.append((anno, MONTH_MAP.get(mese, 0), f"{NORM_MONTH.get(mese, mese.title())} {anno}", f1, f2, f3, tot))
 
     if not rows:
         return None
 
     rows.sort()
-    data = [dict(Mese=lab, F1=f1, F2=f2, F3=f3, Totale=tot) for _, _, lab, f1, f2, f3, tot in rows]
-    return pd.DataFrame(data)
+    df = pd.DataFrame(
+        [dict(Mese=label, F1=f1, F2=f2, F3=f3, Totale=tot) for _,_,label,f1,f2,f3,tot in rows]
+    )
+    return df
 
 # =========================
 # Orchestrator
 # =========================
 
 def parse_pdf(file_bytes: bytes) -> Tuple[Optional[pd.DataFrame], str, int, List[str]]:
-    """Ritorna: (df_completo, titolo_sheet, costante, note_log)"""
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         text_pages = [p.extract_text() or "" for p in pdf.pages]
     full_text = _normalize("\n".join(text_pages))
 
     notes: List[str] = []
 
-    # Prova Repower → poi Enel
     df = parse_repower(full_text)
     brand = "Repower" if df is not None else None
 
@@ -207,28 +197,22 @@ def parse_pdf(file_bytes: bytes) -> Tuple[Optional[pd.DataFrame], str, int, List
     if df is None:
         return None, "Non riconosciuto", 1, ["Layout non riconosciuto (né Repower né Enel)."]
 
-    # Ultimi 12 mesi + correzioni
     df = take_last_12(df)
     df, val_notes = validate_totals(df)
     notes.extend(val_notes)
 
-    # Costante misura
     const = detect_constant(full_text)
     notes.append(f"Costante di misura: x{const}")
 
-    # Doppia tabella (Grafico / Fatturati)
-    grafico = df.copy()
-    grafico.insert(1, "Tipo", "Grafico (kWh)")
-
+    grafico = df.copy(); grafico.insert(1, "Tipo", "Grafico (kWh)")
     fatturati = df.copy()
     fatturati[["F1","F2","F3","Totale"]] = (fatturati[["F1","F2","F3","Totale"]] * const).round().astype(int)
     fatturati.insert(1, "Tipo", "Fatturati (kWh)")
 
-    df_out = pd.concat([grafico, fatturati], axis=0, ignore_index=True)
-    return df_out, brand, const, notes
+    return pd.concat([grafico, fatturati], axis=0, ignore_index=True), brand, const, notes
 
 # =========================
-# UI: upload → parse → excel
+# UI
 # =========================
 
 uploaded = st.file_uploader("Trascina qui i PDF", type=["pdf"], accept_multiple_files=True)
@@ -236,7 +220,6 @@ uploaded = st.file_uploader("Trascina qui i PDF", type=["pdf"], accept_multiple_
 if uploaded:
     logs: List[str] = []
     sheets: Dict[str, pd.DataFrame] = {}
-
     for up in uploaded:
         try:
             data = up.read()
@@ -257,10 +240,10 @@ if uploaded:
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             for sheet, df in sheets.items():
-                g = df[df["Tipo"] == "Grafico (kWh)"].drop(columns=["Tipo"])
-                b = df[df["Tipo"] == "Fatturati (kWh)"].drop(columns=["Tipo"])
+                g = df[df["Tipo"]=="Grafico (kWh)"].drop(columns=["Tipo"])
+                b = df[df["Tipo"]=="Fatturati (kWh)"].drop(columns=["Tipo"])
                 g.to_excel(writer, sheet_name=sheet, index=False, startrow=2)
-                b.to_excel(writer, sheet_name=sheet, index=False, startrow=len(g) + 5)
+                b.to_excel(writer, sheet_name=sheet, index=False, startrow=len(g)+5)
         st.download_button(
             "⬇️ Scarica Excel (Consumi_F1F2F3_per_Fattura.xlsx)",
             data=output.getvalue(),
@@ -271,6 +254,5 @@ if uploaded:
     st.markdown("### Log elaborazione")
     for line in logs:
         st.write(line)
-
 else:
     st.info("Carica uno o più PDF per iniziare.")
