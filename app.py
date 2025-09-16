@@ -27,7 +27,8 @@ ABBR = ["Gen","Feb","Mar","Apr","Mag","Giu","Lug","Ago","Set","Ott","Nov","Dic"]
 MONTH_MAP = {m: i for i, m in enumerate(MONTHS_IT)}
 NORM_MONTH = {m: abbr for m, abbr in zip(MONTHS_IT, ABBR)}
 
-NUM_RE = r"(?:\d{1,3}(?:[.\s’']\d{3})*|\d+)"  # supporta 1.234, 1 234, 1’234, 1234
+# NUM_RE aggiornato: consente 1.518, 1 518, 1’518, e soprattutto 1. 518 (punto + spazio)
+NUM_RE = r"(?:\d{1,3}(?:[.’'\s]\s*\d{3})*|\d+)"
 SEP = r"[ \t]+"
 
 def _normalize(txt: str) -> str:
@@ -56,12 +57,14 @@ def validate_totals(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     return df, notes
 
 def detect_constant(text: str) -> int:
+    # Enel: "Costante Mis. 25,00" / "Costante Mis. 25.00"
     m = re.search(r"Costante\s*Mis\.?\s*[:=]?\s*(\d+(?:[.,]\d+)?)", text, re.IGNORECASE)
     if m:
         try:
             return int(round(float(m.group(1).replace(",", "."))))
         except Exception:
             pass
+    # Repower/altro: "costante 1,00"
     m = re.search(r"\bcostante\b\s*(\d+(?:[.,]\d+)?)", text, re.IGNORECASE)
     if m:
         try:
@@ -151,8 +154,10 @@ def parse_repower(text: str) -> Optional[pd.DataFrame]:
 
     block = m.group(0)
 
+    # pattern riga mese/anno + F1 F2 F3 Totale (usa il NUM_RE aggiornato)
     pat = re.compile(
-        rf"\b({'|'.join(MONTHS_IT)}){SEP}(20\d{{2}}){SEP}({NUM_RE}){SEP}({NUM_RE}){SEP}({NUM_RE}){SEP}({NUM_RE})\b",
+        rf"\b({'|'.join(MONTHS_IT)}){SEP}(20\d{{2}}){SEP}"
+        rf"({NUM_RE}){SEP}({NUM_RE}){SEP}({NUM_RE}){SEP}({NUM_RE})\b",
         re.IGNORECASE
     )
 
@@ -186,6 +191,7 @@ def parse_pdf(file_bytes: bytes) -> Tuple[Optional[pd.DataFrame], str, int, List
 
     notes: List[str] = []
 
+    # Prova Repower, poi Enel
     df = parse_repower(full_text)
     brand = "Repower" if df is not None else None
 
@@ -197,13 +203,16 @@ def parse_pdf(file_bytes: bytes) -> Tuple[Optional[pd.DataFrame], str, int, List
     if df is None:
         return None, "Non riconosciuto", 1, ["Layout non riconosciuto (né Repower né Enel)."]
 
+    # Ultimi 12 mesi + validazione Totale
     df = take_last_12(df)
     df, val_notes = validate_totals(df)
     notes.extend(val_notes)
 
+    # Costante di misura
     const = detect_constant(full_text)
     notes.append(f"Costante di misura: x{const}")
 
+    # Doppia tabella (Grafico / Fatturati)
     grafico = df.copy(); grafico.insert(1, "Tipo", "Grafico (kWh)")
     fatturati = df.copy()
     fatturati[["F1","F2","F3","Totale"]] = (fatturati[["F1","F2","F3","Totale"]] * const).round().astype(int)
