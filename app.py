@@ -27,7 +27,7 @@ ABBR = ["Gen","Feb","Mar","Apr","Mag","Giu","Lug","Ago","Set","Ott","Nov","Dic"]
 MONTH_MAP = {m: i for i, m in enumerate(MONTHS_IT)}
 NORM_MONTH = {m: abbr for m, abbr in zip(MONTHS_IT, ABBR)}
 
-# NUM_RE aggiornato: consente 1.518, 1 518, 1’518, e soprattutto 1. 518 (punto + spazio)
+# Regex per numeri: gestisce "1.518", "1 518", "1’518", e "1. 518"
 NUM_RE = r"(?:\d{1,3}(?:[.’'\s]\s*\d{3})*|\d+)"
 SEP = r"[ \t]+"
 
@@ -57,14 +57,12 @@ def validate_totals(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     return df, notes
 
 def detect_constant(text: str) -> int:
-    # Enel: "Costante Mis. 25,00" / "Costante Mis. 25.00"
     m = re.search(r"Costante\s*Mis\.?\s*[:=]?\s*(\d+(?:[.,]\d+)?)", text, re.IGNORECASE)
     if m:
         try:
             return int(round(float(m.group(1).replace(",", "."))))
         except Exception:
             pass
-    # Repower/altro: "costante 1,00"
     m = re.search(r"\bcostante\b\s*(\d+(?:[.,]\d+)?)", text, re.IGNORECASE)
     if m:
         try:
@@ -78,11 +76,13 @@ def detect_constant(text: str) -> int:
 # =========================
 
 def parse_enel(text: str) -> Optional[pd.DataFrame]:
-    """Parser tollerante per bollette Enel."""
+    """Parser robusto per bollette Enel."""
+    # Cerca il titolo
     title_pat = re.compile(r"Consumi\s+(?:in\s+kWh\s+)?degli?\s+ultimi\s+\d{1,2}\s+mesi", re.IGNORECASE)
     m_title = title_pat.search(text)
-    block = text[m_title.start():m_title.start()+2500] if m_title else text
+    block = text[m_title.start():m_title.start()+3000] if m_title else text
 
+    # Estrai mesi
     month_pat = re.compile(rf"\b({'|'.join(MONTHS_IT)})\b(?:\s+20\d{{2}})?", re.IGNORECASE)
     labels: List[str] = []
     if m_title:
@@ -97,11 +97,10 @@ def parse_enel(text: str) -> Optional[pd.DataFrame]:
         seen = set()
         labels = [l for l in labels if not (l in seen or seen.add(l))]
 
+    # Funzione per prendere serie numeriche
     def grab_any(prefixes, hay):
         pfx = r"|".join([re.escape(p) for p in prefixes])
-        m = re.search(rf"(?:{pfx})\s*[:-]?\s*((?:{NUM_RE}\s*){{6,}})", hay, re.IGNORECASE)
-        if not m:
-            m = re.search(rf"(?:{pfx})\s*[:-]?\s*((?:{NUM_RE}[\s]*)+)", hay, re.IGNORECASE)
+        m = re.search(rf"(?:{pfx})\s*[:-]?\s*((?:{NUM_RE}\s*)+)", hay, re.IGNORECASE)
         if not m:
             return []
         nums = re.findall(NUM_RE, m.group(1))
@@ -112,20 +111,20 @@ def parse_enel(text: str) -> Optional[pd.DataFrame]:
     f3_vals = grab_any(["F3","F 3","Fascia 3","FASCIA 3"], block)
     tot_vals = grab_any(["Tot","Totale","TOTALE","TOT"], block)
 
+    # Se mancano, riprova sul testo intero
     if not (f1_vals and f2_vals and f3_vals and tot_vals):
         f1_vals = f1_vals or grab_any(["F1","F 1","Fascia 1","FASCIA 1"], text)
         f2_vals = f2_vals or grab_any(["F2","F 2","Fascia 2","FASCIA 2"], text)
         f3_vals = f3_vals or grab_any(["F3","F 3","Fascia 3","FASCIA 3"], text)
         tot_vals = tot_vals or grab_any(["Tot","Totale","TOTALE","TOT"], text)
 
-    lengths = [len(v) for v in [f1_vals, f2_vals, f3_vals, tot_vals] if v]
-    if not lengths:
-        return None
-    L = min(lengths)
+    # Allinea le lunghezze
+    lengths = [len(f1_vals), len(f2_vals), len(f3_vals), len(tot_vals)]
+    L = min([l for l in lengths if l > 0], default=0)
     if L == 0:
         return None
 
-    if not labels:
+    if not labels or len(labels) < L:
         labels = [f"M{i+1}" for i in range(L)]
     else:
         labels = labels[:L]
@@ -145,16 +144,9 @@ def parse_repower(text: str) -> Optional[pd.DataFrame]:
         text, re.IGNORECASE | re.DOTALL
     )
     if not m:
-        m = re.search(
-            r"Andamento\s+storico.*?\bENERGIA\b.*?(?=\b(POTENZA|POTENZE|COS.?φ|LEGENDA|NOTE|TARIFFE|ALTRE\s+VOCI)\b|$)",
-            text, re.IGNORECASE | re.DOTALL
-        )
-    if not m:
         return None
-
     block = m.group(0)
 
-    # pattern riga mese/anno + F1 F2 F3 Totale (usa il NUM_RE aggiornato)
     pat = re.compile(
         rf"\b({'|'.join(MONTHS_IT)}){SEP}(20\d{{2}}){SEP}"
         rf"({NUM_RE}){SEP}({NUM_RE}){SEP}({NUM_RE}){SEP}({NUM_RE})\b",
@@ -191,7 +183,6 @@ def parse_pdf(file_bytes: bytes) -> Tuple[Optional[pd.DataFrame], str, int, List
 
     notes: List[str] = []
 
-    # Prova Repower, poi Enel
     df = parse_repower(full_text)
     brand = "Repower" if df is not None else None
 
@@ -203,16 +194,13 @@ def parse_pdf(file_bytes: bytes) -> Tuple[Optional[pd.DataFrame], str, int, List
     if df is None:
         return None, "Non riconosciuto", 1, ["Layout non riconosciuto (né Repower né Enel)."]
 
-    # Ultimi 12 mesi + validazione Totale
     df = take_last_12(df)
     df, val_notes = validate_totals(df)
     notes.extend(val_notes)
 
-    # Costante di misura
     const = detect_constant(full_text)
     notes.append(f"Costante di misura: x{const}")
 
-    # Doppia tabella (Grafico / Fatturati)
     grafico = df.copy(); grafico.insert(1, "Tipo", "Grafico (kWh)")
     fatturati = df.copy()
     fatturati[["F1","F2","F3","Totale"]] = (fatturati[["F1","F2","F3","Totale"]] * const).round().astype(int)
