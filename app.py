@@ -13,7 +13,7 @@ st.set_page_config(page_title="Estrattore Consumi Bollette (Enel/Repower) → Ex
 st.title("⚡ Estrattore Consumi Bollette (Enel/Repower) → Excel")
 st.caption("Carica una o più bollette in PDF. Per ogni file verrà creato un foglio Excel con due tabelle: Grafico (kWh) e Fatturati (kWh).")
 
-DEBUG = False  # metti True per vedere il testo grezzo dei PDF quando il parsing fallisce
+DEBUG = False  # True per mostrare il testo grezzo dei PDF quando il parsing fallisce
 
 # =========================
 # Helpers
@@ -27,12 +27,12 @@ ABBR = ["Gen","Feb","Mar","Apr","Mag","Giu","Lug","Ago","Set","Ott","Nov","Dic"]
 MONTH_MAP = {m: i for i, m in enumerate(MONTHS_IT)}
 NORM_MONTH = {m: abbr for m, abbr in zip(MONTHS_IT, ABBR)}
 
-# Regex per numeri: gestisce "1.518", "1 518", "1’518", e "1. 518"
+# Numeri: 1.518 / 1 518 / 1’518 / 1. 518 / 1518
 NUM_RE = r"(?:\d{1,3}(?:[.’'\s]\s*\d{3})*|\d+)"
 SEP = r"[ \t]+"
 
 def _normalize(txt: str) -> str:
-    """Normalizza testo estratto dai PDF (spazi NBSP, CRLF, spazi multipli)."""
+    """Normalizza testo estratto dai PDF (NBSP, CRLF, spazi multipli)."""
     t = txt.replace("\r", "\n").replace("\xa0", " ")
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{2,}", "\n", t)
@@ -76,13 +76,19 @@ def detect_constant(text: str) -> int:
 # =========================
 
 def parse_enel(text: str) -> Optional[pd.DataFrame]:
-    """Parser robusto per bollette Enel."""
-    # Cerca il titolo
+    """
+    Parser robusto per Enel:
+    - isola il blocco vicino al titolo
+    - cattura le serie tra header e header successivo (F1→F2, F2→F3, F3→Tot, Tot→sezione successiva)
+    - taglia l’eventuale riga dei totali di colonna in coda
+    - allinea agli ultimi 12 valori coerenti
+    """
+    # Titolo
     title_pat = re.compile(r"Consumi\s+(?:in\s+kWh\s+)?degli?\s+ultimi\s+\d{1,2}\s+mesi", re.IGNORECASE)
     m_title = title_pat.search(text)
-    block = text[m_title.start():m_title.start()+3000] if m_title else text
+    block = text[m_title.start():m_title.start()+4000] if m_title else text
 
-    # Estrai mesi
+    # Etichette (best effort)
     month_pat = re.compile(rf"\b({'|'.join(MONTHS_IT)})\b(?:\s+20\d{{2}})?", re.IGNORECASE)
     labels: List[str] = []
     if m_title:
@@ -97,48 +103,84 @@ def parse_enel(text: str) -> Optional[pd.DataFrame]:
         seen = set()
         labels = [l for l in labels if not (l in seen or seen.add(l))]
 
-    # Funzione per prendere serie numeriche
-    def grab_any(prefixes, hay):
-        pfx = r"|".join([re.escape(p) for p in prefixes])
-        m = re.search(rf"(?:{pfx})\s*[:-]?\s*((?:{NUM_RE}\s*)+)", hay, re.IGNORECASE)
+    # Serie tra header e prossimo header
+    def series_between(starts: List[str], stops: List[str], hay: str) -> List[int]:
+        P = r"|".join([re.escape(s) for s in starts])
+        Q = r"|".join([re.escape(s) for s in stops])
+        m = re.search(
+            rf"(?:^|\n)\s*(?:{P})\s*[:-]?\s*(?P<body>.*?)"
+            rf"(?=(?:^|\n)\s*(?:{Q})\b|$)",
+            hay, re.IGNORECASE | re.DOTALL | re.MULTILINE
+        )
         if not m:
-            return []
-        nums = re.findall(NUM_RE, m.group(1))
+            m = re.search(rf"(?:{P})\s*[:-]?\s*(?P<body>.*)", hay, re.IGNORECASE | re.DOTALL)
+            if not m:
+                return []
+        nums = re.findall(NUM_RE, m.group("body"))
         return [norm_int(x) for x in nums]
 
-    f1_vals = grab_any(["F1","F 1","Fascia 1","FASCIA 1"], block)
-    f2_vals = grab_any(["F2","F 2","Fascia 2","FASCIA 2"], block)
-    f3_vals = grab_any(["F3","F 3","Fascia 3","FASCIA 3"], block)
-    tot_vals = grab_any(["Tot","Totale","TOTALE","TOT"], block)
+    H1 = ["F1","F 1","Fascia 1","FASCIA 1"]
+    H2 = ["F2","F 2","Fascia 2","FASCIA 2"]
+    H3 = ["F3","F 3","Fascia 3","FASCIA 3"]
+    HT = ["Tot","Totale","TOTALE","TOT"]
+    STOP_AFTER_TOT = ["Potenza","kW max","GLOSSARIO","Legenda","Dettaglio","Energia reattiva","REATTIVA","POTENZA"]
 
-    # Se mancano, riprova sul testo intero
+    f1_vals = series_between(H1, H2, block)
+    f2_vals = series_between(H2, H3, block)
+    f3_vals = series_between(H3, HT, block)
+    tot_vals = series_between(HT, STOP_AFTER_TOT, block)
+
+    # Fallback sull'intero testo se serve
     if not (f1_vals and f2_vals and f3_vals and tot_vals):
-        f1_vals = f1_vals or grab_any(["F1","F 1","Fascia 1","FASCIA 1"], text)
-        f2_vals = f2_vals or grab_any(["F2","F 2","Fascia 2","FASCIA 2"], text)
-        f3_vals = f3_vals or grab_any(["F3","F 3","Fascia 3","FASCIA 3"], text)
-        tot_vals = tot_vals or grab_any(["Tot","Totale","TOTALE","TOT"], text)
+        f1_vals = f1_vals or series_between(H1, H2, text)
+        f2_vals = f2_vals or series_between(H2, H3, text)
+        f3_vals = f3_vals or series_between(H3, HT, text)
+        tot_vals = tot_vals or series_between(HT, STOP_AFTER_TOT, text)
 
-    # Allinea le lunghezze
+    # ---- TAGLIO dei totali di colonna in coda (se presenti) ----
+    def drop_column_total(vals: List[int]) -> List[int]:
+        if len(vals) >= 13:
+            s = sum(vals[:-1])
+            last = vals[-1]
+            # Tolleranza 2% o 10 kWh (copre colonne con 12 valori)
+            if abs(last - s) <= max(10, int(0.02 * s)):
+                return vals[:-1]
+        return vals
+
+    f1_vals = drop_column_total(f1_vals)
+    f2_vals = drop_column_total(f2_vals)
+    f3_vals = drop_column_total(f3_vals)
+    tot_vals = drop_column_total(tot_vals)
+
+    # Allineamento: prendi la minima lunghezza > 0 e tieni gli ULTIMI L valori
     lengths = [len(f1_vals), len(f2_vals), len(f3_vals), len(tot_vals)]
     L = min([l for l in lengths if l > 0], default=0)
     if L == 0:
         return None
 
-    if not labels or len(labels) < L:
-        labels = [f"M{i+1}" for i in range(L)]
+    f1_vals, f2_vals, f3_vals, tot_vals = f1_vals[-L:], f2_vals[-L:], f3_vals[-L:], tot_vals[-L:]
+
+    # Mantieni al massimo 12 (ultimi 12 mesi)
+    if L > 12:
+        f1_vals, f2_vals, f3_vals, tot_vals = f1_vals[-12:], f2_vals[-12:], f3_vals[-12:], tot_vals[-12:]
+        L = 12
+
+    # Etichette: se esistono, usa le ultime L; altrimenti M1..ML
+    if labels and len(labels) >= L:
+        labels = labels[-L:]
     else:
-        labels = labels[:L]
+        labels = [f"M{i+1}" for i in range(L)]
 
     return pd.DataFrame({
         "Mese": labels,
-        "F1": f1_vals[:L],
-        "F2": f2_vals[:L],
-        "F3": f3_vals[:L],
-        "Totale": tot_vals[:L],
+        "F1": f1_vals,
+        "F2": f2_vals,
+        "F3": f3_vals,
+        "Totale": tot_vals,
     })
 
 def parse_repower(text: str) -> Optional[pd.DataFrame]:
-    """Parser Repower centrato sulla sezione ENERGIA."""
+    """Parser Repower centrato sulla sezione ENERGIA (mese anno F1 F2 F3 Totale)."""
     m = re.search(
         r"\bENERGIA\b.*?(?=\b(POTENZA|POTENZE|COS.?φ|LEGENDA|NOTE|TARIFFE|ALTRE\s+VOCI)\b|$)",
         text, re.IGNORECASE | re.DOTALL
